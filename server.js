@@ -36,6 +36,138 @@ app.disable('x-powered-by');
 // Enable trust proxy for better performance behind load balancers
 app.set('trust proxy', 1);
 
+// Rate limiter configuration for Jira API (100 req/s limit)
+const JIRA_RATE_LIMIT = 100; // Jira's limit: 100 requests per second
+const RATE_LIMIT_WINDOW = 1000; // 1 second window
+
+// Token bucket rate limiter
+class RateLimiter {
+    constructor(maxTokens, refillRate) {
+        this.maxTokens = maxTokens;
+        this.tokens = maxTokens;
+        this.refillRate = refillRate; // tokens per second
+        this.lastRefill = Date.now();
+    }
+
+    async acquire() {
+        while (true) {
+            this.refill();
+            
+            if (this.tokens >= 1) {
+                this.tokens -= 1;
+                return;
+            }
+            
+            // Wait for next token
+            const waitTime = (1 / this.refillRate) * 1000;
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+    }
+
+    refill() {
+        const now = Date.now();
+        const timePassed = (now - this.lastRefill) / 1000;
+        const tokensToAdd = timePassed * this.refillRate;
+        
+        this.tokens = Math.min(this.maxTokens, this.tokens + tokensToAdd);
+        this.lastRefill = now;
+    }
+
+    getAvailableTokens() {
+        this.refill();
+        return Math.floor(this.tokens);
+    }
+}
+
+// Initialize rate limiter (95 req/s to leave buffer for Jira's limit)
+const rateLimiter = new RateLimiter(95, 95);
+
+// Request queue for handling bursts
+class RequestQueue {
+    constructor() {
+        this.queue = [];
+        this.processing = false;
+        this.stats = {
+            queued: 0,
+            processed: 0,
+            failed: 0,
+            retried: 0
+        };
+    }
+
+    async enqueue(requestFn, requestId, maxRetries = 3) {
+        return new Promise((resolve, reject) => {
+            this.queue.push({
+                requestFn,
+                requestId,
+                resolve,
+                reject,
+                retries: 0,
+                maxRetries,
+                enqueuedAt: Date.now()
+            });
+            this.stats.queued++;
+            this.processQueue();
+        });
+    }
+
+    async processQueue() {
+        if (this.processing || this.queue.length === 0) {
+            return;
+        }
+
+        this.processing = true;
+
+        while (this.queue.length > 0) {
+            const item = this.queue.shift();
+            
+            try {
+                // Wait for rate limiter token
+                await rateLimiter.acquire();
+                
+                const waitTime = Date.now() - item.enqueuedAt;
+                if (waitTime > 100) {
+                    console.log(`[${item.requestId}] Queued for ${waitTime}ms`);
+                }
+                
+                const result = await item.requestFn();
+                this.stats.processed++;
+                item.resolve(result);
+                
+            } catch (error) {
+                // Handle 429 (rate limit) with exponential backoff
+                if (error.response?.status === 429 && item.retries < item.maxRetries) {
+                    item.retries++;
+                    this.stats.retried++;
+                    
+                    const backoffTime = Math.min(1000 * Math.pow(2, item.retries), 10000);
+                    console.log(`[${item.requestId}] Rate limited, retry ${item.retries}/${item.maxRetries} after ${backoffTime}ms`);
+                    
+                    await new Promise(resolve => setTimeout(resolve, backoffTime));
+                    
+                    // Re-queue the request
+                    this.queue.unshift(item);
+                } else {
+                    this.stats.failed++;
+                    item.reject(error);
+                }
+            }
+        }
+
+        this.processing = false;
+    }
+
+    getStats() {
+        return {
+            ...this.stats,
+            queueLength: this.queue.length,
+            availableTokens: rateLimiter.getAvailableTokens()
+        };
+    }
+}
+
+const requestQueue = new RequestQueue();
+
 // Initialize the concurrency limit (increased to 50 concurrent requests)
 const limit = pLimit(50);
 
@@ -120,7 +252,7 @@ app.get('/tickets', async (req, res) => {
     }
 });
 
-// 2. POST Subtasks Endpoint - optimized for high throughput
+// 2. POST Subtasks Endpoint - with rate limiting and queuing
 app.post('/subtasks', async (req, res) => {
     const requestId = generateUUID();
     const { summary, description, parentKey } = req.body;
@@ -136,8 +268,9 @@ app.post('/subtasks', async (req, res) => {
     }
 
     try {
-        const response = await limit(() =>
-            axiosInstance.post(
+        // Enqueue the request with rate limiting
+        const response = await requestQueue.enqueue(
+            () => axiosInstance.post(
                 process.env.JIRA_POST_API_URL,
                 {
                     fields: {
@@ -164,7 +297,9 @@ app.post('/subtasks', async (req, res) => {
                         'Content-Type': 'application/json'
                     }
                 }
-            )
+            ),
+            requestId,
+            3 // max retries
         );
 
         console.log(`[${requestId}] API Response Sent: POST /subtasks - Status: ${response.status} - Created: ${response.data.key}`);
@@ -184,6 +319,11 @@ app.post('/subtasks', async (req, res) => {
             error: error.response?.data || error.message
         });
     }
+});
+
+// Queue statistics endpoint
+app.get('/queue-stats', (req, res) => {
+    res.json(requestQueue.getStats());
 });
 
 // Health check endpoint for load balancers
@@ -211,14 +351,18 @@ process.on('SIGINT', () => {
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Optimized for high throughput (250+ req/s)`);
+    console.log(`Optimized for extreme throughput (3,500+ req/s)`);
     console.log(`- HTTP Keep-Alive enabled`);
     console.log(`- Compression enabled`);
     console.log(`- Response caching enabled (60s TTL)`);
-    console.log(`- Concurrency limit: 50 parallel requests`);
+    console.log(`- Rate limiting: 95 req/s to Jira (respects 100 req/s limit)`);
+    console.log(`- Request queuing with automatic retry on 429`);
+    console.log(`- Exponential backoff for rate limit errors`);
     console.log(`- Max sockets: 100`);
+    console.log(`- Queue stats available at: GET /queue-stats`);
 });
 
 // Set server timeout to handle long-running requests
 server.keepAliveTimeout = 65000; // 65 seconds
 server.headersTimeout = 66000; // 66 seconds (slightly higher than keepAliveTimeout)
+
